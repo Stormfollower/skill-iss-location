@@ -1,231 +1,73 @@
-from mycroft import MycroftSkill, intent_file_handler, intent_handler
-from mycroft.skills.core import resting_screen_handler
-import matplotlib.pyplot as plt
-from mpl_toolkits.basemap import Basemap
-import tempfile
-from os.path import join, dirname
-from matplotlib.offsetbox import OffsetImage, AnnotationBbox
-from time import sleep
-from requests_cache import CachedSession
-from datetime import timedelta, datetime
-from mtranslate import translate
-from adapt.intent import IntentBuilder
-from lingua_franca.format import nice_duration
+"""
+skill iss-tracker
+Copyright (C) 2018  Andreas Lorensen
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+"""
+
+from ovos_workshop.skill import OVOSSkill
+from mycroft import intent_file_handler
+from ovos-lingua-franca import pronounce_number
+import requests
+import json
 
 
-class ISSLocationSkill(MycroftSkill):
+class IssTracker(MycroftSkill):
     def __init__(self):
-        super(ISSLocationSkill, self).__init__(name="I S S Location Skill")
-        if "geonames_user" not in self.settings:
-            self.settings["geonames_user"] = "jarbas"
-        if "map_style" not in self.settings:
-            self.settings["map_style"] = "ortho"
-        if "center_iss" not in self.settings:
-            self.settings["center_iss"] = True
-        if "center_location" not in self.settings:
-            self.settings["center_location"] = False
-        if "iss_size" not in self.settings:
-            self.settings["iss_size"] = 0.5
-        if "iss_icon" not in self.settings:
-            self.settings["iss_icon"] = "iss3.png"
-        if "dpi" not in self.settings:
-            self.settings["dpi"] = 500
-        _expire_after = timedelta(minutes=5)
-        self._session = CachedSession(backend='memory',
-                                      expire_after=_expire_after)
+        MycroftSkill.__init__(self)
 
-    def update_picture(self):
+    @intent_file_handler('tracker.iss.intent')
+    def handle_tracker_iss(self, message):
+        # get the 'current' latitude and longitude of the ISS from open-notify.org in JSON
+        reqISSLocation = requests.get("http://api.open-notify.org/iss-now.json")
+        issObj = json.loads(reqISSLocation.text)  # JSON payload of ISS location data
+        latISS = issObj['iss_position']['latitude']
+        lngISS = issObj['iss_position']['longitude']
+        latISSstr = pronounce_number(float(latISS), lang=self.lang, places=4)
+        lngISSstr = pronounce_number(float(lngISS), lang=self.lang, places=4)
+        lang = self.lang[:2]
+        # construct a string witj ISS lat & long to determine a geographic object/toponym associated with it
+        # This is "Reverse Gecoding" availbe from geonames.org
+        # Sign up for a free user name at http://www.geonames.org/ and repalce YourUserName with it
+        # !! remember to activate web servoces for your user name !!
+        oceanGeoNamesReq = "http://api.geonames.org/oceanJSON?lat=" + latISS + "&lng=" + lngISS + "&lang=" + lang + "&username=mycroft_iss_tracker"
+        landGeoNamesReq = "http://api.geonames.org/countryCodeJSON?formatted=true&lat=" + latISS + "&lng=" + lngISS + "&lang=" + lang + "&username=mycroft_iss_tracker&style=full"
+
+        self.log.info(oceanGeoNamesReq)
+        self.log.info(landGeoNamesReq)
+
+        # Since the Earth is 3/4 water, we'll chek to see if the ISS is over water first;
+        # in the case where this is not so, we handle the exception by  searching for a country it is
+        # over, and is this is not coded for on GenNames, we just we say we don't know
+
+        oceanGeoNamesRes = requests.get(oceanGeoNamesReq)
+        toponymObj = json.loads(oceanGeoNamesRes.text)
         try:
-            data = self._session.get(
-                "http://api.open-notify.org/iss-now.json").json()
-            astronauts = self._session.get(
-                "http://api.open-notify.org/astros.json").json()
+            toponym = "the " + toponymObj['ocean']['name']
+        except KeyError:
+            landGeoNamesRes = requests.get(landGeoNamesReq)
+            toponymObj = json.loads(landGeoNamesRes.text)
+            toponym = toponymObj['countryName']
+        except Exception:
+            toponym = "unknown"
 
-            self.settings["astronauts"] = astronauts["people"]
-            lat = data['iss_position']['latitude']
-            lon = data['iss_position']['longitude']
-            if not self.settings.get("lat") or \
-                    not self.settings.get("lon") or \
-                    lat != self.settings['lat'] or \
-                    lon != self.settings['lon']:
-                params = {
-                    "username": self.settings["geonames_user"],
-                    "lat": lat,
-                    "lng": lon
-                }
-                ocean_names = "http://api.geonames.org/oceanJSON"
-                land_names = "http://api.geonames.org/countryCodeJSON"
-
-                # reverse geo
-                data = self._session.get(ocean_names, params=params).json()
-                try:
-                    toponym = "The " + data['ocean']['name']
-                except:
-
-                    try:
-                        params = {
-                            "username": self.settings["geonames_user"],
-                            "lat": lat,
-                            "lng": lon,
-                            "formatted": True,
-                            "style": "full"
-                        }
-                        data = self._session.get(land_names,
-                                                 params=params).json()
-                        toponym = data['countryName']
-                    except:
-                        toponym = "unknown"
-                if not self.lang.lower().startswith("en") and \
-                        toponym != "unknown":
-                    toponym = translate(toponym, self.lang)
-                self.settings['toponym'] = toponym
-                image = self.generate_map(lat, lon)
-
-                self.settings['lat'] = lat
-                self.settings['lon'] = lon
-                self.settings['imgLink'] = image
-
-        except Exception as e:
-            self.log.exception(e)
-        self.gui['imgLink'] = self.settings['imgLink']
-        self.gui['caption'] = self.settings['toponym'] + \
-                              " Lat: {lat}  Lon: {lon}".format(
-                                  lat=self.settings["lat"],
-                                  lon=self.settings["lon"])
-        self.gui['lat'] = self.settings['lat']
-        self.gui['lot'] = self.settings['lon']
-        self.gui["astronauts"] = self.settings["astronauts"]
-        self.set_context("iss")
-
-    @resting_screen_handler("ISS")
-    def idle(self, message):
-        self.update_picture()
-        self.gui.clear()
-        self.gui.show_image(self.settings['imgLink'],
-                            fill='PreserveAspectFit')
-
-    def generate_map(self, lat, lon):
-        lat = float(lat)
-        lon = float(lon)
-        icon = join(dirname(__file__), self.settings["iss_icon"])
-        output = join(tempfile.gettempdir(), "iss.jpg")
-        lat_0 = None
-        lon_0 = None
-        if self.settings["center_iss"]:
-            lat_0 = lat
-            lon_0 = lon
-        elif self.settings["center_location"]:
-            lat_0 = self.location["coordinate"]["latitude"]
-            lon_0 = self.location["coordinate"]["longitude"]
-        if self.settings["map_style"] == "cyl":
-            lat_0 = None
-            lon_0 = None
-        m = Basemap(projection=self.settings["map_style"],
-                    resolution=None, lat_0=lat_0, lon_0=lon_0)
-        m.bluemarble()
-        x, y = m(lon, lat)
-
-        iss = plt.imread(icon)
-        im = OffsetImage(iss, zoom=self.settings["iss_size"])
-        ab = AnnotationBbox(im, (x, y), xycoords='data', frameon=False)
-
-        # Get the axes object from the basemap and add the AnnotationBbox artist
-        m._check_ax().add_artist(ab)
-
-        plt.savefig(output, dpi=self.settings["dpi"], bbox_inches='tight',
-                    facecolor="black")
-        plt.close()
-        return output
-
-    @intent_file_handler("about.intent")
-    def handle_about_iss_intent(self, message):
-        iss = join(dirname(__file__), "ui", "images", "iss.png")
-        utterance = self.dialog_renderer.render("about", {})
-        self.gui.show_image(iss, override_idle=True,
-                            fill='PreserveAspectFit', caption=utterance)
-        self.speak(utterance, wait=True)
-        sleep(1)
-        self.gui.clear()
-
-    @intent_file_handler('where_iss.intent')
-    def handle_iss(self, message):
-        self.update_picture()
-        self.gui.show_image(self.settings['imgLink'],
-                            caption=self.gui['caption'],
-                            fill='PreserveAspectFit')
-        if self.settings['toponym'] == "unknown":
-            self.speak_dialog("location.unknown",
-                              {"latitude": self.settings['lat'],
-                               "longitude": self.settings['lon']},
-                              wait=True)
+        # print "the ISS is over: " + toponym
+        if toponym == "unknown":
+            self.speak_dialog("location.unknown", {"latitude": latISSstr, "longitude": lngISSstr})
         else:
-            self.speak_dialog("location.current",
-                              {"latitude": self.settings['lat'],
-                               "longitude": self.settings['lon'],
-                               "toponym": self.settings['toponym']},
-                              wait=True)
-        sleep(1)
-        self.gui.clear()
-
-    @intent_file_handler('when_iss.intent')
-    def handle_when(self, message):
-        lat = self.location["coordinate"]["latitude"]
-        lon = self.location["coordinate"]["longitude"]
-        if not self.settings.get("passing_by"):
-            params = {"lat": lat, "lon": lon}
-            passing = self._session.get(
-                "http://api.open-notify.org/iss-pass.json",
-                params=params).json()
-            self.settings["passing_by"] = passing["response"]
-
-        next_passage = self.settings["passing_by"][0]
-        ts = next_passage["risetime"]
-        dt = datetime.fromtimestamp(ts)
-        delta = datetime.now() - dt
-        duration = nice_duration(delta, lang=self.lang)
-        caption = self.location_pretty + " " + dt.strftime("%m/%d/%Y, %H:%M:%S")
-        image = self.generate_map(lat, lon)
-
-        self.gui.show_image(image,
-                            caption=caption,
-                            fill='PreserveAspectFit')
-
-        self.speak_dialog("location.when",
-                          {"duration": duration,
-                           "toponym": self.location_pretty},
-                          wait=True)
-        sleep(1)
-        self.gui.clear()
-
-    @intent_handler(IntentBuilder("WhoISSIntent")
-                    .require("who").require("onboard").require("iss"))
-    def handle_who(self, message):
-        self.update_picture()
-        people = [p["name"] for p in self.settings["astronauts"]
-                  if p["craft"] == "ISS"]
-        people = ", ".join(people)
-        iss = join(dirname(__file__), "ui", "images", "iss.png")
-        self.gui.show_image(iss, override_idle=True,
-                            fill='PreserveAspectFit', caption=people)
-        self.speak_dialog("who", {"people": people}, wait=True)
-        sleep(1)
-        self.gui.clear()
-
-    @intent_handler(IntentBuilder("NumberISSIntent")
-                    .require("how_many").require("onboard").require("iss"))
-    def handle_number(self, message):
-        self.update_picture()
-        people = [p["name"] for p in self.settings["astronauts"]
-                  if p["craft"] == "ISS"]
-        num = len(people)
-        people = ", ".join(people)
-        iss = join(dirname(__file__), "ui", "images", "iss.png")
-        self.gui.show_image(iss, override_idle=True,
-                            fill='PreserveAspectFit', caption=people)
-        self.speak_dialog("number", {"number": num}, wait=True)
-        sleep(1)
-        self.gui.clear()
+            self.speak_dialog("location.current", {"latitude": latISSstr, "longitude": lngISSstr, "toponym": toponym})
 
 
 def create_skill():
-    return ISSLocationSkill()
+    return IssTracker()
